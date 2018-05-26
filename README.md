@@ -14,7 +14,7 @@ Because I needed a memorable name, and it Czechs keys.
 
 ## What do I need to run it?
 
-Python 3.6 and GnuPG 2.0.15 or later.  There are no other dependencies.
+UNIX, Python 3.6, and GnuPG 2.0.15 or later.  There are no other dependencies.
 
 ## What does it check for?
 
