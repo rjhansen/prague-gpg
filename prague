@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+# coding: UTF-8
+
+# MIT License
+#
+# Copyright (c) 2018 Robert J. Hansen
+#
+# Permission is hereby granted, free of charge, to any person 
+# obtaining a copy of this software and associated documentation 
+# files (the "Software"), to deal in the Software without 
+# restriction, including without limitation the rights to use,
+# copy, modify, merge, publish, distribute, sublicense, and/or 
+# sell copies of the Software, and to permit persons to whom 
+# the Software is furnished to do so, subject to the following
+# conditions:
+#
+# The above copyright notice and this permission notice shall 
+# be included in all copies or substantial portions of the 
+# Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND 
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT 
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+#
+# Share and enjoy!
+
+import logging
+import pathlib
+import sys
+import re
+
+from subprocess import run, PIPE, CalledProcessError
+from os.path import isfile
+from os import access, R_OK, X_OK, sep, environ, listdir
+
+
+_executable = None
+_keyids = None
+_logger = None
+
+_logger = logging.getLogger()
+_logger.setLevel(logging.DEBUG)
+_handler = logging.FileHandler(environ["HOME"] + sep + "prague.log",
+encoding="UTF-8", mode="w")
+_bf = logging.Formatter('{asctime} {name} {levelname:8s} {message}',
+                        style='{')
+_handler.setFormatter(_bf)
+_logger.addHandler(_handler)
+
+class NoPathFound(Exception):
+    def __init__(self):
+        super("no PATH found -- cannot locate GnuPG")
+
+
+class GnuPGNotFound(Exception):
+    def __init__(self):
+        super("GnuPG not found -- aborting")
+
+
+def gnupg_path():
+    global _executable
+    if _executable is not None:
+        return _executable
+    
+    if "PATH" not in environ:
+        _logger.fatal("Could not find PATH")
+        raise NoPathFound()
+
+    rxp = re.compile(r"^.*(\d\.\d\.\d).*$")
+    gpg_filenames = set(["gpg", "gpg2"])
+    for dirname in environ["PATH"].split(":"):
+        _logger.debug("searching {} for GnuPG".format(dirname))
+        matches = [X for X in listdir(dirname)
+            if X in gpg_filenames]
+        if len(matches) == 0:
+            continue
+        if len(matches) == 2:
+            _logger.debug("found both gpg and gpg2, using gpg2")
+            matches = ["gpg2"]
+        path = pathlib.PosixPath(dirname).joinpath(matches[0])
+        if not (isfile(path.as_posix()) and 
+        access(path.as_posix(), R_OK|X_OK)):
+            _logger.warn("found a GnuPG, but it's not real?")
+            continue
+
+        cmd = [path.as_posix(), "--version"]
+        try:
+            proc = run(cmd, shell=False,stdout=PIPE)
+            data = proc.stdout
+            runes = data.decode("UTF-8", errors="strict")
+        except CalledProcessError:
+            _logger.warn("could not execute " + path.as_posix())
+            continue
+        except UnicodeDecodeError:
+            _logger.warn(path.as_posix() + " spat garbage")
+            continue
+
+        lines = runes.split("\n")
+        if lines:
+            match = rxp.match(lines[0])
+        if not match:
+            _logger.warn("this doesn't look like GnuPG")
+            continue
+        version = match.group(1).split(".")
+        major, minor, bugfix = [int(X) for X in version]
+        min_ver = (2 << 16) + (0 << 8) + 15
+        this_ver = (major << 16) + (minor << 8) + bugfix
+        if this_ver >= min_ver:
+            msg = "found GnuPG version {}.{}.{} at {}"
+            msg = msg.format(major, minor, bugfix, path.as_posix())
+            _logger.info(msg)
+            _executable = path.as_posix()
+            return _executable
+                
+    _logger.fatal("could not find GnuPG!")
+    sys.exit(1)
+
+def get_keyids(reload=False):
+    global _keyids
+    _logger.debug("getting keyids")
+    if _keyids is not None and not reload:
+        return _keyids
+    rxp = re.compile("^pub:[^r]")
+    cmd = [gnupg_path(), "--fixed-list-mode", "--with-colons",
+    "--no-tty", "--list-keys"]
+    try:
+        proc = run(cmd, shell=False, stdout=PIPE)
+        data = proc.stdout.decode("UTF-8", errors="replace")
+        data = data.split("\n")
+    except CalledProcessError:
+        _logger.fatal("couldn't call GnuPG!")
+        sys.exit(1)
+    except UnicodeDecodeError:
+        _logger.fatal("got garbage from GnuPG")
+        sys.exit(1)
+    _keyids = set([X.split(":")[4] for X in data if rxp.match(X)])
+    _logger.info("found {} non-revoked pubkeys".format(len(_keyids)))
+    return _keyids
+
+def sanity_check():
+    _logger.debug("in sanity check")
+    rxp = re.compile("^uid:[^r]")
+    cipher_rx = re.compile(r"(S\d+( S\d+)*)")
+    hash_rx = re.compile(r"(H\d+( H\d+)*)")
+    mdc_re = re.compile("mdc")
+    key_problems = {}
+    for keyid in get_keyids():
+        _logger.info("sanity checking keyid " + keyid)
+        cmd = [gnupg_path(), "--fixed-list-mode", "--with-colons",
+        "--no-tty", "--edit-key", keyid, "showpref", "quit"]
+        try:
+            proc = run(cmd, shell=False, stdout=PIPE)
+            runes = proc.stdout.decode("UTF-8", errors="replace")
+        except CalledProcessError:
+            _logger.fatal("couldn't call GnuPG!")
+            sys.exit(1)
+        except UnicodeDecodeError:
+            _logger.fatal("got garbage from GnuPG")
+            sys.exit(1)
+        lines = [X for X in runes.split("\n") if rxp.match(X)]
+        key_problems[keyid] = {}
+        probs = key_problems[keyid]
+        for line in lines:
+            parts = line.split(":")
+            uid = parts[9]
+            _logger.info("looking at uid " + uid)
+            probs[uid] = []
+            prefs = parts[12]
+
+            if not mdc_re.search(line):
+                _logger.info("MDC is not explicitly set")
+                probs[uid].append("No MDC enabled")
+
+            ciphers = cipher_rx.search(prefs)
+            if ciphers:
+                ciphers = ciphers.group(1).split(" ")
+                ciphers = [int(X[1:]) for X in ciphers]
+                if 2 in ciphers and ciphers[-1] != 2:
+                    _logger.info("3DES shadowing")
+                    probs[uid].append("3DES shadowing")
+                first_old_cipher = 0
+                last_new_cipher = 0
+                for index in range(len(ciphers) - 1, -1, -1):
+                    if ciphers[index] < 7:
+                        first_old_cipher = index
+                for index in range(0, len(ciphers)):
+                    if ciphers[index] >= 7:
+                        last_new_cipher = index
+                if first_old_cipher < last_new_cipher:
+                    _logger.info("prefers old ciphers")
+                    probs[uid].append("Prefers old ciphers")
+                for index in range(0, len(ciphers)):
+                    if ciphers[index] >= 7:
+                        break
+                    if index == len(ciphers) - 1:
+                        _logger.info("no support for newer ciphers")
+                        probs[uid].append("No newer ciphers")
+            else:
+                _logger.info("only supports 3DES")
+                probs[uid].append("Only 3DES is used")
+            
+            hashes = hash_rx.search(prefs)
+            if hashes:
+                hashes = hashes.group(1).split(" ")
+                hashes = [int(X[1:]) for X in hashes]
+
+                if 1 in hashes:
+                    _logger.info("supports MD5")
+                    probs[uid].append("MD5 listed in prefs")
+                if 2 in hashes and hashes[-1] != 2:
+                    _logger.info("SHA-1 shadowing")
+                    probs[uid].append("SHA-1 shadowing")
+                if 3 in hashes:
+                    three_pos = 0
+                    for index in range(len(hashes)):
+                        if hashes[index] == 3:
+                            three_pos = index
+                            break
+                    for index in range(0, three_pos):
+                        if hashes[index] < 8:
+                            _logger.info("prefers old hashes")
+                            probs[uid].append("Prefers old hashes")
+            else:
+                _logger.info("only supports SHA-1")
+                probs[uid].append("Only SHA-1 is used")
+            probs[uid] = "|".join(probs[uid])
+    _logger.info("successfully completed!")
+    _logger.info("processed {} certificates".format(len(key_problems)))
+    return key_problems
+
+if __name__ == "__main__":
+    import csv
+    results = sanity_check()
+    output = []
+    for key in results:
+        for uid in results[key]:
+            if results[key][uid]:
+                output.append([key, uid, results[key][uid]])
+            else:
+                output.append([key, uid, ""])
+    csvwriter = csv.writer(sys.stdout, dialect="excel")
+    [csvwriter.writerow(X) for X in output]
