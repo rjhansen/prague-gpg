@@ -28,6 +28,14 @@ Python 3.6 and GnuPG 2.0.15 or later.  There are no other dependencies.
 - **RIPEMD-160 being preferred over the SHA-2 family.**  Similar logic to "old ciphers being preferred over newer ones".
 - **Lack of MDC support.**  If your certificate doesn't advertise MDC support, that's a serious problem.
 
+## How do I fix these problems?
+
+- **Short subkeys.** If your subkeys are too short, create new ones with `gpg --edit-key [key ID] addkey` and revoke them with `revkey`.  Upload your new key to the keyservers.  You're done.
+  - **Read the GnuPG instructions before you revoke anything.**
+- **Short primary keys.**  Add the lines `default-preference-list AES256 AES SHA512 SHA256 BZIP2 ZIP ZLIB` and `cert-digest-algo SHA512` to your `~/.gnupg/gpg.conf` file.  Then generate a new key and migrate to it.
+- **Shadowing and preference issues, and/or MD5 support.** `gpg --edit-key [keyid] setpref AES256 AES SHA512 SHA256 BZIP2 ZIP ZLIB` will fix these nicely.  Don't forget to upload your key to the keyservers.
+- **Lack of MDC support.**  Good question. Ask Werner.
+
 ## What output does it create?
 
 GnuPG will (probably) throw some data to stderr.  `prague` will throw Excel-formatted `.csv` output to stdout.  You can capture it by `./prague > output.csv` and load it up in the spreadsheet of your choice.
