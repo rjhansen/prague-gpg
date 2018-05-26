@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # coding: UTF-8
-
-# MIT License
+#
 #
 # Copyright (c) 2018 Robert J. Hansen
 #
@@ -35,22 +34,29 @@ import sys
 import re
 
 from subprocess import run, PIPE, CalledProcessError
-from os.path import isfile
-from os import access, R_OK, X_OK, sep, environ, listdir
+from os.path import isfile, isdir
+from os import access, R_OK, W_OK, X_OK, sep, environ, listdir
 
+
+if ("HOME" not in environ or 
+    not isdir(environ["HOME"]) or
+    not access(environ["HOME"], W_OK)):
+    print("Your HOME is either not set or not writable.",
+    file=sys.stderr, flush=True)
+    print("Fix this, then run again.", file=sys.stderr, flush=True)
+    sys.exit(1)
 
 _executable = None
 _keyids = None
-_logger = None
-
 _logger = logging.getLogger()
 _logger.setLevel(logging.DEBUG)
 _handler = logging.FileHandler(environ["HOME"] + sep + "prague.log",
-encoding="UTF-8", mode="w")
+                               encoding="UTF-8", mode="w")
 _bf = logging.Formatter('{asctime} {name} {levelname:8s} {message}',
                         style='{')
 _handler.setFormatter(_bf)
 _logger.addHandler(_handler)
+
 
 class NoPathFound(Exception):
     def __init__(self):
@@ -77,45 +83,44 @@ def gnupg_path():
         _logger.debug("searching {} for GnuPG".format(dirname))
         matches = [X for X in listdir(dirname)
             if X in gpg_filenames]
-        if len(matches) == 0:
-            continue
         if len(matches) == 2:
-            _logger.debug("found both gpg and gpg2, using gpg2")
-            matches = ["gpg2"]
-        path = pathlib.PosixPath(dirname).joinpath(matches[0])
-        if not (isfile(path.as_posix()) and 
-        access(path.as_posix(), R_OK|X_OK)):
-            _logger.warn("found a GnuPG, but it's not real?")
-            continue
+            _logger.debug("found both gpg and gpg2, trying gpg2 first")
+            matches = ["gpg2", "gpg"]
+        for thing in matches:
+            path = pathlib.PosixPath(dirname).joinpath(thing)
+            if not (isfile(path.as_posix()) and 
+            access(path.as_posix(), R_OK|X_OK)):
+                _logger.warn("found a GnuPG, but it's not real?")
+                continue
 
-        cmd = [path.as_posix(), "--version"]
-        try:
-            proc = run(cmd, shell=False,stdout=PIPE)
-            data = proc.stdout
-            runes = data.decode("UTF-8", errors="strict")
-        except CalledProcessError:
-            _logger.warn("could not execute " + path.as_posix())
-            continue
-        except UnicodeDecodeError:
-            _logger.warn(path.as_posix() + " spat garbage")
-            continue
+            cmd = [path.as_posix(), "--version"]
+            try:
+                proc = run(cmd, shell=False,stdout=PIPE)
+                data = proc.stdout
+                runes = data.decode("UTF-8", errors="strict")
+            except CalledProcessError:
+                _logger.warn("could not execute " + path.as_posix())
+                continue
+            except UnicodeDecodeError:
+                _logger.warn(path.as_posix() + " spat garbage")
+                continue
 
-        lines = runes.split("\n")
-        if lines:
-            match = rxp.match(lines[0])
-        if not match:
-            _logger.warn("this doesn't look like GnuPG")
-            continue
-        version = match.group(1).split(".")
-        major, minor, bugfix = [int(X) for X in version]
-        min_ver = (2 << 16) + (0 << 8) + 15
-        this_ver = (major << 16) + (minor << 8) + bugfix
-        if this_ver >= min_ver:
-            msg = "found GnuPG version {}.{}.{} at {}"
-            msg = msg.format(major, minor, bugfix, path.as_posix())
-            _logger.info(msg)
-            _executable = path.as_posix()
-            return _executable
+            lines = runes.split("\n")
+            if lines:
+                match = rxp.match(lines[0])
+            if not match:
+                _logger.warn("this doesn't look like GnuPG")
+                continue
+            version = match.group(1).split(".")
+            major, minor, bugfix = [int(X) for X in version]
+            min_ver = (2 << 16) + (0 << 8) + 15
+            this_ver = (major << 16) + (minor << 8) + bugfix
+            if this_ver >= min_ver:
+                msg = "found GnuPG version {}.{}.{} at {}"
+                msg = msg.format(major, minor, bugfix, path.as_posix())
+                _logger.info(msg)
+                _executable = path.as_posix()
+                return _executable
                 
     _logger.fatal("could not find GnuPG!")
     sys.exit(1)
@@ -145,9 +150,13 @@ def get_keyids(reload=False):
 def sanity_check():
     _logger.debug("in sanity check")
     rxp = re.compile("^uid:[^r]")
+    subxp = re.compile("^((pub)|(sub)|(ssb)):[^r]")
     cipher_rx = re.compile(r"(S\d+( S\d+)*)")
     hash_rx = re.compile(r"(H\d+( H\d+)*)")
     mdc_re = re.compile("mdc")
+    bigkeys = set([1, 2, 3, 16, 17])
+    ecckeys = set([18, 19, 22])
+    badkeys = set([20])
     key_problems = {}
     for keyid in get_keyids():
         _logger.info("sanity checking keyid " + keyid)
@@ -162,10 +171,28 @@ def sanity_check():
         except UnicodeDecodeError:
             _logger.fatal("got garbage from GnuPG")
             sys.exit(1)
-        lines = [X for X in runes.split("\n") if rxp.match(X)]
+        keylines = [X for X in runes.split("\n") if subxp.match(X)]
+        if not keylines:
+            continue
         key_problems[keyid] = {}
+        key_problems[keyid]["Key checks"] = []
+        for keyline in keylines:
+            parts = keyline.split(":")
+            size = int(parts[2])
+            algo = int(parts[3])
+            if algo in bigkeys and size < 3072 or\
+            algo in ecckeys and size < 256:
+                msg = "too small for long-term trust"
+                key_problems[keyid]["Key checks"].append(msg)
+            if algo in badkeys:
+                msg = "using a known dangerous algo"
+                key_problems[keyid]["Key checks"].append(msg)
+            key_problems[keyid]["Key checks"] = \
+            list(set(key_problems[keyid]["Key checks"]))
+
+        uidlines = [X for X in runes.split("\n") if rxp.match(X)]
         probs = key_problems[keyid]
-        for line in lines:
+        for line in uidlines:
             parts = line.split(":")
             uid = parts[9]
             _logger.info("looking at uid " + uid)
@@ -183,8 +210,8 @@ def sanity_check():
                 if 2 in ciphers and ciphers[-1] != 2:
                     _logger.info("3DES shadowing")
                     probs[uid].append("3DES shadowing")
-                first_old_cipher = 0
-                last_new_cipher = 0
+                first_old_cipher = 99
+                last_new_cipher = len(ciphers) - 1
                 for index in range(len(ciphers) - 1, -1, -1):
                     if ciphers[index] < 7:
                         first_old_cipher = index
@@ -228,7 +255,10 @@ def sanity_check():
             else:
                 _logger.info("only supports SHA-1")
                 probs[uid].append("Only SHA-1 is used")
-            probs[uid] = "|".join(probs[uid])
+    for keyid in key_problems:
+        for uid in key_problems[keyid]:
+            probs = key_problems[keyid][uid]
+            key_problems[keyid][uid] = "|".join(probs)
     _logger.info("successfully completed!")
     _logger.info("processed {} certificates".format(len(key_problems)))
     return key_problems
@@ -241,7 +271,5 @@ if __name__ == "__main__":
         for uid in results[key]:
             if results[key][uid]:
                 output.append([key, uid, results[key][uid]])
-            else:
-                output.append([key, uid, ""])
     csvwriter = csv.writer(sys.stdout, dialect="excel")
     [csvwriter.writerow(X) for X in output]
